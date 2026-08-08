@@ -6,3 +6,6 @@
 *.pth
 **/best_model/*.pth
 *.pth
+**/best_model/*.pth
+*.pth
+**/data/FashionMNIST/raw/
