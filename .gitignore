@@ -4,3 +4,5 @@
 **/data/
 **/best_model/*.pth
 *.pth
+**/best_model/*.pth
+*.pth
