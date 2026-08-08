@@ -155,3 +155,57 @@ class MultiHeadedAttention(nn.Module):
         x = x.view(nbatches, -1, self.h * self.d_k)
 
         return self.linears[-1](x)
+
+
+# ============== 层归一化：有对应库函数实现，但手动写用于学习理解 ===============
+class LayerNorm(nn.Module):
+    def __init__(self, features, eps=1e-6):
+        super(LayerNorm, self).__init__()
+        # 公式：self.a_2 * (x - mean) / torch.sqrt(std ** 2 + self.eps) + self.b_2
+        # 加了一个self.eps小偏移，因为要防止分母为0(std标准差有为0的风险)
+        self.a_2 = nn.Parameter(torch.ones(features))
+        self.b_2 = nn.Parameter(torch.zeros(features))
+        # features通道等于d_model，因为输入形状为[batches, seq_len, d_model]
+        self.eps = eps
+
+    def forward(self, x):
+        # 求x的最后一个维度d_model的均值和方差
+        # x的形状为[batches, seq_len, d_model]，也就是有batches个样本，每个样本有seq_len个token
+        # 对于每个token，在d_model上取其均值和方差做处理，这样输出依旧为[batches, seq_len, d_model]，但每个token d_model上的数值已被归一化
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+
+        return ((x - mean) / (math.sqrt(std**2 + self.eps))) * self.a_2 + self.b_2
+
+
+# ============== 前馈神经网络 ===============
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        # 网络组成：两个全连接层+激活函数
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(p=dropout)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.w_1(x))
+        # d_ff通常更大，dropout放在这里更合适
+        x = self.dropout(x)
+        x = self.w_2(x)
+
+        return x
+
+
+# ============== SubLayerConnection ===============
+class SublayerConnection(nn.Module):
+    def __init__(self, features, dropout):
+        super(SublayerConnection, self).__init__()
+        self.norm = LayerNorm(features)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer):
+        # sublayer是外部声明的方法，作为参数传进来；比如可以是一个多头注意力类/feedforward的实例
+        return x + self.dropout(sublayer(self.norm(x)))
+
+
