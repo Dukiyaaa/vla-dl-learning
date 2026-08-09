@@ -25,7 +25,7 @@ class Embeddings(nn.Module):
 
 # 位置编码：关键是PE相关的两个公式
 class PositionalEncoding(nn.Module):
-    def __init__(self, max_len, d_model):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=0.05)
         # 如果词嵌入向量是横向的一行向量的话，对应的位置编码向量也是同样的
@@ -116,6 +116,7 @@ class MultiHeadedAttention(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, query, key, value, mask=None):
+        # 注意，此时的query, key, value均为词嵌入矩阵
         # 取batch size
         nbatches = query.size(0)
 
@@ -208,4 +209,168 @@ class SublayerConnection(nn.Module):
         # sublayer是外部声明的方法，作为参数传进来；比如可以是一个多头注意力类/feedforward的实例
         return x + self.dropout(sublayer(self.norm(x)))
 
+
+# ============== 编码器部分：自注意力 + 前馈网络 ===============
+class EncoderLayer(nn.Module):
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super(EncoderLayer, self).__init__()
+        # 去看论文上的图，会发现编码器由N个编码层组成
+        # 每个编码层，由两个sublayer组成，一个sub调用注意力，一个sub调用前馈神经网络
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        # 建立两个sublayer来容纳上面的两个类
+        self.sublayers = clones(SublayerConnection(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        # 把注意力模块和前馈神经网络分别嵌入两个sublayer中
+        # 进入sublayer后会先对输入做norm操作，随后再经过函数，因此这里需要用语法糖
+        # x本身为词嵌入矩阵，进入self_attn的forward后会由三个linear投影成QKV
+        x = self.sublayers[0](x, lambda x: self.self_attn(x, x, x, mask))
+        # feed_forward本身只需要一个参数，所以不用语法糖；这里x依旧经过norm后进入feed_forward
+        x = self.sublayers[1](x, self.feed_forward)
+        # 输出的x是没有经过norm的
+        return x
+
+
+class Encoder(nn.Module):
+    def __init__(self, layer, N):
+        super(Encoder, self).__init__()
+        # 多个encoder-layer
+        self.layers = clones(layer, N)
+        # layer.size等于d_model
+        self.norm = LayerNorm(layer.size)
+
+    def forward(self, x, mask):
+        for layer in self.layers:
+            x = layer(x, mask)
+
+        # 上面说了，最后一个encoder-layer的输出是没有经过norm的，所以要补上
+        x = self.norm(x)
+        return x
+
+
+# ============== 解码器部分：掩码注意力 + 交叉注意力 + 前馈网络 ===============
+class DecoderLayer(nn.Module):
+    def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
+        super(DecoderLayer, self).__init__()
+        # 定义三个层：自注意力 + 交叉注意力 + 前馈网络
+        self.self_attn = self_attn
+        self.src_attn = src_attn
+        self.feed_forward = feed_forward
+        self.sublayers = clones(SublayerConnection(size, dropout), 3)
+        self.size = size
+
+    def forward(self, x, memory, tgt_mask, src_mask):
+        # memory代表编码层encoder-layer的输出
+        m = memory
+        # 第一个子层：带掩码的自注意力，掩码为tgt_mask：target mask
+        x = self.sublayers[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+        # 第二个子层：带掩码的交叉注意力，掩码为src_mask：source mask，Q用解码器的，KV用编码器的
+        x = self.sublayers[1](x, lambda x: self.src_attn(x, m, m, src_mask))
+        # 第三个子层：前向网络
+        x = self.sublayers[2](x, self.feed_forward)
+
+        return x
+
+
+class Decoder(nn.Module):
+    def __init__(self, layer, N):
+        super(Decoder, self).__init__()
+        # 多个encoder-layer
+        self.layers = clones(layer, N)
+        # layer.size等于d_model
+        self.norm = LayerNorm(layer.size)
+
+    def forward(self, x, m, tgt_mask, src_mask):
+        for layer in self.layers:
+            x = layer(x, m, tgt_mask, src_mask)
+
+        # 上面说了，最后一个encoder-layer的输出是没有经过norm的，所以要补上
+        x = self.norm(x)
+        return x
+
+
+# ============== 生成器部分：linear + softmax ===============
+class Generator(nn.Module):
+    def __init__(self, d_model, v_cab):
+        super(Generator, self).__init__()
+        self.linear = nn.Linear(d_model, v_cab)
+        # 依旧是最后一个维度做softmax
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.softmax(x)
+        return x
+
+
+# ============== Transformer：组装组件 ===============
+class Transformer(nn.Module):
+    def __init__(self, src_embed, encoder, tgt_embed, decoder, generator):
+        super(Transformer, self).__init__()
+        # transformer由五个部分构成
+        # 源词嵌入矩阵 + 位置编码
+        self.src_embed = src_embed
+        # 编码层
+        self.encoder = encoder
+        # 目标词嵌入矩阵 + 位置编码
+        self.tgt_embed = tgt_embed
+        # 解码层
+        self.decoder = decoder
+        # 生成器
+        self.generator = generator
+
+    # src：源语言 token ID 序列（如 [ [101, 202, 303] ]）
+    # src_embed(src)：词嵌入 + 位置编码 → [batch, src_len, d_model]
+    def encode(self, src, src_mask):
+        return self.encoder(self.src_embed(src), src_mask)
+
+    # tgt：目标语言 token ID 序列（如 [ [2, 150, 200, 3] ]）
+    # tgt_embed(tgt)：词嵌入 + 位置编码 → [batch, tgt_len, d_model]
+    def decode(self, tgt, memory, tgt_mask, src_mask):
+        return self.decoder(self.tgt_embed(tgt), memory, tgt_mask, src_mask)
+
+    def forward(self, tgt, src, tgt_mask, src_mask):
+        # 先由encode获得memory
+        memory = self.encode(src, src_mask)
+        return self.decode(tgt, memory, tgt_mask, src_mask)
+
+
+# ============== 代入实际参数构建模型 ===============
+def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
+    c = copy.deepcopy
+    # 实例化核心组件
+    # 多头注意力
+    attn = MultiHeadedAttention(d_model, h, dropout).to("cpu")
+    # 前向网络
+    feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout).to("cpu")
+    # 位置编码
+    position = PositionalEncoding(d_model, dropout).to("cpu")
+    # Transformer
+    model = Transformer(
+        # src_embed
+        nn.Sequential(
+            Embeddings(src_vocab, d_model).to("cpu"),
+            c(position)
+        ),
+        # encoder
+        Encoder(EncoderLayer(d_model, c(attn), c(feed_forward), dropout).to("cpu"), N).to("cpu"),
+        # tgt_embed
+        nn.Sequential(
+            Embeddings(tgt_vocab, d_model).to("cpu"),
+            c(position)
+        ),
+        # decoder
+        Decoder(DecoderLayer(d_model, c(attn), c(attn), c(feed_forward), dropout).to("cpu"), N).to("cpu"),
+        # generator
+        Generator(d_model, tgt_vocab).to("cpu")
+    )
+
+    # 初始化模型参数
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)  # 注意末尾有下划线
+
+    return model.to("cpu")
 
